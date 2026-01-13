@@ -4,50 +4,50 @@ import sys
 import time
 import socket
 import select
+import signal
+from typing import Dict, Tuple
 
-# ⚠️ Librairie NON standard (mais imposée par le cours/projet pour System V MQ)
-import sysv_ipc
+import sysv_ipc  # imposée par le cours/projet (System V MQ)
 
 # -----------------------
-# CONFIG MINIMALE
+# CONFIG
 # -----------------------
-MQ_KEY = 111          # Clé System V (int). Doit matcher display.py
-CMD_TYPE = 1          # Type des messages envoyés à env (commandes display->env)
+MQ_KEY = 111
+CMD_TYPE = 1
 
 HOST = "127.0.0.1"
-PORT = 1789           # Port TCP pour JOIN predator/prey
-G=10
+PORT = 1789
+
+G = 10                 # herbe consommée par un prey quand il FEED
+TICK_SLEEP = 0.2       # pas de simulation
+
+DEBUG = True
 
 
 def encode_msg(s: str) -> bytes:
-    """System V message queues échangent des bytes."""
-    return s.encode("utf-8")
+    return (s + "\n").encode("utf-8")
 
 
 def decode_msg(b: bytes) -> str:
-    """Convertit bytes -> str."""
     return b.decode("utf-8", errors="replace")
 
 
 def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> bool:
     """
-    Traite une commande venant du display.
-    Format attendu: "<PID> <ACTION>"
-    Ex: "12345 STATUS" ou "12345 QUIT"
-
-    Retourne True si on doit continuer, False si on doit arrêter env.
+    Format: "<PID> <ACTION>"
+    ACTION: STATUS | QUIT
     """
     cmd = cmd.strip()
     parts = cmd.split(maxsplit=1)
     if len(parts) != 2:
-        print(f"[env] bad command format: {cmd!r}")
+        print(f"[env] bad display cmd: {cmd!r}")
         return True
 
-    sender_pid_str, action = parts[0], parts[1].upper()
+    pid_str, action = parts[0], parts[1].upper()
     try:
-        sender_pid = int(sender_pid_str)
+        sender_pid = int(pid_str)
     except ValueError:
-        print(f"[env] bad sender pid: {sender_pid_str!r}")
+        print(f"[env] bad sender pid: {pid_str!r}")
         return True
 
     if action == "STATUS":
@@ -55,64 +55,62 @@ def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> 
             f"tick={state['tick']} predators={state['predators']} "
             f"preys={state['preys']} grass={state['grass']} drought={state['drought']}"
         )
-        mq.send(encode_msg(payload), type=sender_pid)
+        mq.send(payload.encode("utf-8"), type=sender_pid)
         return True
 
     if action == "QUIT":
-        mq.send(encode_msg("OK quitting"), type=sender_pid)
+        mq.send(b"OK quitting", type=sender_pid)
         return False
 
-    mq.send(encode_msg(f"ERR unknown action {action}"), type=sender_pid)
+    mq.send(f"ERR unknown action {action}".encode("utf-8"), type=sender_pid)
     return True
 
 
-def handle_join(server_socket: socket.socket, state: dict) -> None:
+def safe_kill(pid: int, who: str) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"[env] SIGTERM sent to PID {pid} ({who})")
+    except ProcessLookupError:
+        print(f"[env] PID {pid} already dead ({who})")
+    except PermissionError:
+        print(f"[env] no permission to kill PID {pid} ({who})")
+
+
+def parse_line(line: str) -> Tuple[str, str, int]:
     """
-    Accepte (si disponible) une connexion JOIN non-bloquante.
-    Le client envoie:
-      - "JOIN PREDATOR"
-      - "JOIN PREY"
+    Expected: "<CMD> <KIND> <PID>"
+    CMD in {JOIN, FEED, REPRO, DIE}
+    KIND in {PREY, PREDATOR}
     """
-    readable, _, _ = select.select([server_socket], [], [], 0)
-    if server_socket not in readable:
-        return
-
-    client_socket, address = server_socket.accept()
-    with client_socket:
-        data = client_socket.recv(1024)
-        msg = data.decode("utf-8", errors="replace").strip()
-
-        if msg == "JOIN PREDATOR":
-            state["predators"] += 1
-            client_socket.sendall(b"OK\n")
-            print(f"[env] predator joined from {address}")
-
-        elif msg == "JOIN PREY":
-            state["preys"] += 1
-            client_socket.sendall(b"OK\n")
-            print(f"[env] prey joined from {address}")
-        
-        else:
-            client_socket.sendall(b"ERR\n")
-            print(f"[env] bad join msg from {address}: {msg!r}")
+    parts = line.strip().split()
+    if len(parts) != 3:
+        raise ValueError(f"bad format (expected 3 tokens): {line!r}")
+    cmd = parts[0].upper()
+    kind = parts[1].upper()
+    pid = int(parts[2])
+    if cmd not in {"JOIN", "FEED", "REPRO", "DIE"}:
+        raise ValueError(f"unknown cmd: {cmd}")
+    if kind not in {"PREY", "PREDATOR"}:
+        raise ValueError(f"unknown kind: {kind}")
+    return cmd, kind, pid
 
 
 def main() -> int:
     print(f"[env] PID={os.getpid()} starting")
 
-    # 1) Message Queue
+    # --- MQ ---
     mq = sysv_ipc.MessageQueue(MQ_KEY, sysv_ipc.IPC_CREAT)
-    print(f"[env] MessageQueue created with key={MQ_KEY} (check with: ipcs -q)")
+    print(f"[env] MessageQueue created with key={MQ_KEY} (ipcs -q)")
 
-    # 2) Socket server (non-bloquant)
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind((HOST, PORT))
-    server_socket.listen(10)
-    server_socket.setblocking(False)
+    # --- Non-blocking TCP server ---
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(50)
+    server.setblocking(False)
     print(f"[env] Socket server listening on {HOST}:{PORT}")
 
-    # 3) Etat minimal (V1/V2)
+    # --- State ---
     state = {
         "tick": 0,
         "predators": 0,
@@ -121,39 +119,188 @@ def main() -> int:
         "drought": False,
     }
 
+    # --- Agents registry ---
+    # agents[pid] = {"kind": "PREY"/"PREDATOR", "alive": True}
+    agents: Dict[int, Dict[str, object]] = {}
+
+    # --- Repro counters: 1 birth per 2 REPRO requests ---
+    repro_pending = {"PREY": 0, "PREDATOR": 0}
+
+    # --- Client sockets ---
+    clients = set()                 # set[socket.socket]
+    recv_buf: Dict[socket.socket, str] = {}  # per-client text buffer
+
     running = True
     try:
         while running:
-            # ---- Simulation minimale (pour voir des valeurs bouger) ----
+            # ---- simulation tick ----
             state["tick"] += 1
             if not state["drought"]:
                 state["grass"] += 1
 
-            # ---- 1) Lire commandes display via MQ (non-bloquant) ----
+            # ---- display MQ (non-blocking) ----
             try:
-                raw, _msg_type = mq.receive(type=CMD_TYPE, block=False)
+                raw, _t = mq.receive(type=CMD_TYPE, block=False)
                 cmd = decode_msg(raw)
                 running = handle_display_command(mq, state, cmd)
             except sysv_ipc.BusyError:
-                pass  # aucune commande
+                pass
 
-            # ---- 2) Accepter des JOIN via socket (non-bloquant) ----
-            handle_join(server_socket, state)
+            # ---- socket multiplexing ----
+            rlist = [server] + list(clients)
+            readable, _, exceptional = select.select(rlist, [], rlist, 0)
 
-            # ---- 3) Pause pour éviter CPU à 100% ----
-            time.sleep(0.2)
+            # handle new connections
+            if server in readable:
+                while True:
+                    try:
+                        cs, addr = server.accept()
+                        cs.setblocking(False)
+                        clients.add(cs)
+                        recv_buf[cs] = ""
+                        if DEBUG:
+                            print(f"[env] accepted connection from {addr}")
+                    except BlockingIOError:
+                        break
+
+            # handle client data
+            for cs in list(clients):
+                if cs not in readable:
+                    continue
+                try:
+                    data = cs.recv(4096)
+                except BlockingIOError:
+                    continue
+
+                if not data:
+                    # client closed
+                    clients.remove(cs)
+                    recv_buf.pop(cs, None)
+                    try:
+                        cs.close()
+                    except Exception:
+                        pass
+                    continue
+
+                recv_buf[cs] += decode_msg(data)
+
+                # process full lines
+                while "\n" in recv_buf[cs]:
+                    line, rest = recv_buf[cs].split("\n", 1)
+                    recv_buf[cs] = rest
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        cmd, kind, pid = parse_line(line)
+                    except Exception as e:
+                        cs.sendall(encode_msg(f"ERR {e}"))
+                        continue
+
+                    # ---- COMMANDS ----
+                    if cmd == "JOIN":
+                        agents[pid] = {"kind": kind, "alive": True}
+                        if kind == "PREY":
+                            state["preys"] += 1
+                        else:
+                            state["predators"] += 1
+                        cs.sendall(encode_msg("OK JOIN"))
+                        print(f"[env] {kind} joined pid={pid}")
+                        continue
+
+                    if cmd == "REPRO":
+                        # 1 birth per 2 requests (your rule)
+                        repro_pending[kind] += 1
+                        if repro_pending[kind] >= 2:
+                            repro_pending[kind] -= 2
+                            if kind == "PREY":
+                                state["preys"] += 1
+                            else:
+                                state["predators"] += 1
+                            print(f"[env] REPRO birth: +1 {kind}")
+                            cs.sendall(encode_msg("OK REPRO BIRTH"))
+                        else:
+                            cs.sendall(encode_msg("OK REPRO QUEUED"))
+                        continue
+
+                    if cmd == "FEED":
+                        if kind == "PREY":
+                            if state["grass"] >= G:
+                                state["grass"] -= G
+                                cs.sendall(encode_msg("OK FEED GRASS"))
+                                if DEBUG:
+                                    print(f"[env] prey pid={pid} ate grass (-{G})")
+                            else:
+                                cs.sendall(encode_msg("NO NO_GRASS"))
+                            continue
+
+                        # PREDATOR feeding: eat 1 prey if any
+                        if state["preys"] > 0:
+                            state["preys"] -= 1
+
+                            # Try to kill one known alive prey process (optional)
+                            prey_pid_to_kill = None
+                            for apid, info in agents.items():
+                                if info.get("alive") and info.get("kind") == "PREY":
+                                    prey_pid_to_kill = apid
+                                    break
+                            if prey_pid_to_kill is not None:
+                                agents[prey_pid_to_kill]["alive"] = False
+                                safe_kill(prey_pid_to_kill, "prey eaten")
+
+                            cs.sendall(encode_msg("OK FEED PREY"))
+                            print(f"[env] predator pid={pid} ate a prey")
+                        else:
+                            cs.sendall(encode_msg("NO NO_PREY"))
+                        continue
+
+                    if cmd == "DIE":
+                        # mark dead + decrement counts
+                        info = agents.get(pid)
+                        if info and info.get("alive"):
+                            info["alive"] = False
+                            if kind == "PREY":
+                                state["preys"] = max(0, state["preys"] - 1)
+                            else:
+                                state["predators"] = max(0, state["predators"] - 1)
+
+                        cs.sendall(encode_msg("OK DIE"))
+                        print(f"[env] {kind} pid={pid} died (requested)")
+                        safe_kill(pid, f"{kind.lower()} died")
+                        continue
+
+            # handle exceptional sockets
+            for cs in exceptional:
+                if cs is server:
+                    continue
+                if cs in clients:
+                    clients.remove(cs)
+                recv_buf.pop(cs, None)
+                try:
+                    cs.close()
+                except Exception:
+                    pass
+
+            time.sleep(TICK_SLEEP)
 
     except KeyboardInterrupt:
         print("\n[env] KeyboardInterrupt -> exiting")
 
     finally:
-        # Nettoyage socket
+        # close clients
+        for cs in list(clients):
+            try:
+                cs.close()
+            except Exception:
+                pass
+        clients.clear()
+
         try:
-            server_socket.close()
+            server.close()
         except Exception:
             pass
 
-        # Nettoyage MQ (important)
         try:
             mq.remove()
             print("[env] MessageQueue removed")
