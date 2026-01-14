@@ -6,6 +6,9 @@ import socket
 import select
 import signal
 from typing import Dict, Tuple
+import multiprocessing as mp
+from pathlib import Path
+
 
 import sysv_ipc  # imposée par le cours/projet (System V MQ)
 
@@ -94,6 +97,14 @@ def parse_line(line: str) -> Tuple[str, str, int]:
         raise ValueError(f"unknown kind: {kind}")
     return cmd, kind, pid
 
+def run_prey_proc(host: str, port: int, H: int, R: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
+    from prey import agent_main
+    agent_main(host, port, H, R, e_gain, e_decay, tick_sleep)
+
+def run_predator_proc(host: str, port: int, H: int, R: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
+    from predator import agent_main
+    agent_main(host, port, H, R, e_gain, e_decay, tick_sleep)
+
 
 def main() -> int:
     print(f"[env] PID={os.getpid()} starting")
@@ -118,13 +129,33 @@ def main() -> int:
         "grass": 100,
         "drought": False,
     }
+    # --- processus enfants de env ---
+    children: list[mp.Process] = []
+    
+    def spawn_prey(children: list[mp.Process]) -> int:
+        p = mp.Process(target=run_prey_proc, args=(HOST, PORT, 50, 75, 50, 5, 0.2), daemon=True)
+        p.start()
+        children.append(p)
+        return p.pid
+
+    def spawn_predator(children: list[mp.Process]) -> int:
+        p = mp.Process(target=run_predator_proc, args=(HOST, PORT, 50, 75, 80, 7, 0.2), daemon=True)
+        p.start()
+        children.append(p)
+        return p.pid
+
+
 
     # --- Agents registry ---
     # agents[pid] = {"kind": "PREY"/"PREDATOR", "alive": True}
     agents: Dict[int, Dict[str, object]] = {}
 
-    # --- Repro counters: 1 birth per 2 REPRO requests ---
-    repro_pending = {"PREY": 0, "PREDATOR": 0}
+    # --- Reproduction sexuée: 2 parents distincts requis ---
+    repro_ready: Dict[str, set[int]] = {
+        "PREY": set(),
+        "PREDATOR": set(),
+    }
+
 
     # --- Client sockets ---
     clients = set()                 # set[socket.socket]
@@ -160,7 +191,7 @@ def main() -> int:
                         recv_buf[cs] = ""
                         if DEBUG:
                             print(f"[env] accepted connection from {addr}")
-                    except BlockingIOError:
+                    except BlockingIOError: #a built-in exception that occurs when an input/output (I/O) operation is blocked. This exception is typically raised when a non-blocking operation is requested, but it can't be completed immediately.
                         break
 
             # handle client data
@@ -169,8 +200,18 @@ def main() -> int:
                     continue
                 try:
                     data = cs.recv(4096)
-                except BlockingIOError:
+                except (BlockingIOError, InterruptedError):
                     continue
+                except ConnectionResetError:
+                    # le client a été tué / a crash -> on ferme proprement
+                    clients.remove(cs)
+                    recv_buf.pop(cs, None)
+                    try:
+                        cs.close()
+                    except Exception:
+                        pass
+                    continue
+
 
                 if not data:
                     # client closed
@@ -210,18 +251,24 @@ def main() -> int:
                         continue
 
                     if cmd == "REPRO":
-                        # 1 birth per 2 requests (your rule)
-                        repro_pending[kind] += 1
-                        if repro_pending[kind] >= 2:
-                            repro_pending[kind] -= 2
+                        # 1) on enregistre ce PID comme "prêt à se reproduire"
+                        repro_ready[kind].add(pid)
+
+                        # 2) si on a au moins 2 parents distincts, on fait un birth
+                        if len(repro_ready[kind]) >= 2:
+                            # on prend 2 parents distincts et on les enlève du set
+                            parent1 = repro_ready[kind].pop()
+                            parent2 = repro_ready[kind].pop()
+                            # spawn réel + update state
                             if kind == "PREY":
-                                state["preys"] += 1
+                                new_pid = spawn_prey(children)
+                                print(f"[env] BIRTH PREY: parents=({parent1},{parent2}) -> spawned pid={new_pid}")
                             else:
-                                state["predators"] += 1
-                            print(f"[env] REPRO birth: +1 {kind}")
+                                new_pid = spawn_predator(children)
+                                print(f"[env] BIRTH PREDATOR: parents=({parent1},{parent2}) -> spawned pid={new_pid}")
                             cs.sendall(encode_msg("OK REPRO BIRTH"))
                         else:
-                            cs.sendall(encode_msg("OK REPRO QUEUED"))
+                            cs.sendall(encode_msg("OK REPRO WAITING"))
                         continue
 
                     if cmd == "FEED":
@@ -239,7 +286,7 @@ def main() -> int:
                         if state["preys"] > 0:
                             state["preys"] -= 1
 
-                            # Try to kill one known alive prey process (optional)
+                            # Try to kill one known alive prey process
                             prey_pid_to_kill = None
                             for apid, info in agents.items():
                                 if info.get("alive") and info.get("kind") == "PREY":
@@ -248,7 +295,7 @@ def main() -> int:
                             if prey_pid_to_kill is not None:
                                 agents[prey_pid_to_kill]["alive"] = False
                                 safe_kill(prey_pid_to_kill, "prey eaten")
-
+                                repro_ready["PREY"].discard(prey_pid_to_kill)
                             cs.sendall(encode_msg("OK FEED PREY"))
                             print(f"[env] predator pid={pid} ate a prey")
                         else:
@@ -264,6 +311,9 @@ def main() -> int:
                                 state["preys"] = max(0, state["preys"] - 1)
                             else:
                                 state["predators"] = max(0, state["predators"] - 1)
+                        # retirer ce pid des "candidats reproduction" (si présent)
+                        repro_ready["PREY"].discard(pid)
+                        repro_ready["PREDATOR"].discard(pid)
 
                         cs.sendall(encode_msg("OK DIE"))
                         print(f"[env] {kind} pid={pid} died (requested)")
@@ -306,6 +356,11 @@ def main() -> int:
             print("[env] MessageQueue removed")
         except Exception as e:
             print(f"[env] Warning: failed to remove queue: {e}", file=sys.stderr)
+        for p in children:
+            if p.is_alive():
+                p.terminate()
+        for p in children:
+            p.join(timeout=1)
 
     print("[env] stopped")
     return 0

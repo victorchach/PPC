@@ -4,13 +4,15 @@ import time
 import socket
 import random
 
+# valeurs par défaut (quand tu lances predator.py à la main)
 HOST = "127.0.0.1"
 PORT = 1789
 
+# seuils
 H = 50
 R = 75
-E_GAIN = 80
-E_DECAY = 7
+E_GAIN = 80     # gain d'énergie quand il mange une proie
+E_DECAY = 7     # perte d'énergie par tick
 
 TICK_SLEEP = 0.2
 
@@ -30,7 +32,11 @@ def send_line(sock: socket.socket, s: str) -> str:
     return recv_line(sock)
 
 
-def main() -> int:
+def agent_main(host: str, port: int, H_: int, R_: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
+    """
+    La logique predator, mais paramétrable.
+    -> env.py pourra lancer ça dans un nouveau process via multiprocessing.
+    """
     pid = os.getpid()
     print(f"[predator] PID={pid} starting")
 
@@ -41,8 +47,9 @@ def main() -> int:
     }
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((HOST, PORT))
+        s.connect((host, port))
 
+        # JOIN
         resp = send_line(s, f"JOIN PREDATOR {pid}")
         print(f"[predator] env: {resp}")
 
@@ -50,30 +57,39 @@ def main() -> int:
             while True:
                 state["tick"] += 1
 
+                # actif/passif (simple)
                 state["active"] = (random.random() < 0.6)
-                state["energy"] -= E_DECAY
+                state["energy"] -= e_decay
 
+                # mort
                 if state["energy"] < 0:
                     resp = send_line(s, f"DIE PREDATOR {pid}")
                     print(f"[predator] env: {resp} -> exiting (energy={state['energy']})")
                     break
 
-                if state["active"] and state["energy"] > R:
+                # reproduction
+                if state["active"] and state["energy"] > R_:
                     resp = send_line(s, f"REPRO PREDATOR {pid}")
                     print(f"[predator] env: {resp}")
+                    # coût d'énergie optionnel
                     state["energy"] -= 15
 
-                if state["active"] and state["energy"] < H:
+                # feed (manger une proie)
+                if state["active"] and state["energy"] < H_:
                     resp = send_line(s, f"FEED PREDATOR {pid}")
                     print(f"[predator] env: {resp}")
                     if resp.startswith("OK"):
-                        state["energy"] += E_GAIN
+                        state["energy"] += e_gain
 
-                time.sleep(TICK_SLEEP)
+                time.sleep(tick_sleep)
 
         except KeyboardInterrupt:
             print("\n[predator] KeyboardInterrupt -> exiting")
 
+
+def main() -> int:
+    # quand tu lances "python3 predator.py", tu gardes le même comportement qu'avant
+    agent_main(HOST, PORT, H, R, E_GAIN, E_DECAY, TICK_SLEEP)
     return 0
 
 
