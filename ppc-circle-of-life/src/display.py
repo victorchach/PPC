@@ -40,8 +40,10 @@ def main() -> int:
     while True:
         print("\n--- DISPLAY ---")
         print("1) status")
-        print("2) quit env")
-        print("3) exit display")
+        print("2) add prey")
+        print("3) add predator")
+        print("4) quit env")
+        print("5) exit display")
         choice = input("> ").strip()
 
         if choice == "1":
@@ -49,10 +51,18 @@ def main() -> int:
             print("[display] env:", resp)
 
         elif choice == "2":
-            resp = send_cmd(mq, my_pid, "QUIT")
+            resp = send_cmd(mq, my_pid, "ADD_PREY")
             print("[display] env:", resp)
 
         elif choice == "3":
+            resp = send_cmd(mq, my_pid, "ADD_PREDATOR")
+            print("[display] env:", resp)
+        
+        elif choice == "4":
+            resp = send_cmd(mq, my_pid, "QUIT")
+            print("[display] env:", resp)
+        
+        elif choice == "5":
             print("[display] bye")
             return 0
 

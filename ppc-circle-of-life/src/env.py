@@ -35,23 +35,23 @@ def decode_msg(b: bytes) -> str:
     return b.decode("utf-8", errors="replace")
 
 
-def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> bool:
+def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> int:
     """
     Format: "<PID> <ACTION>"
-    ACTION: STATUS | QUIT
+    ACTION: STATUS | QUIT | ADD_PREY | ADD_PREDATOR
     """
     cmd = cmd.strip()
     parts = cmd.split(maxsplit=1)
     if len(parts) != 2:
         print(f"[env] bad display cmd: {cmd!r}")
-        return True
+        return 1
 
     pid_str, action = parts[0], parts[1].upper()
     try:
         sender_pid = int(pid_str)
     except ValueError:
         print(f"[env] bad sender pid: {pid_str!r}")
-        return True
+        return 1
 
     if action == "STATUS":
         payload = (
@@ -59,12 +59,20 @@ def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> 
             f"preys={state['preys']} grass={state['grass']} drought={state['drought']}"
         )
         mq.send(payload.encode("utf-8"), type=sender_pid)
-        return True
+        return 1
 
     if action == "QUIT":
         mq.send(b"OK quitting", type=sender_pid)
-        return False
+        return 0
+    
+    if action == "ADD_PREY":
+        mq.send(b"OK adding prey", type=sender_pid)
+        return 2
 
+    if action == "ADD_PREDATOR":
+        mq.send(b"OK adding predator", type=sender_pid)
+        return 3
+    
     mq.send(f"ERR unknown action {action}".encode("utf-8"), type=sender_pid)
     return True
 
@@ -161,9 +169,9 @@ def main() -> int:
     clients = set()                 # set[socket.socket]
     recv_buf: Dict[socket.socket, str] = {}  # per-client text buffer
 
-    running = True
+    running = 1
     try:
-        while running:
+        while running != 0 :
             # ---- simulation tick ----
             state["tick"] += 1
             if not state["drought"]:
@@ -174,6 +182,12 @@ def main() -> int:
                 raw, _t = mq.receive(type=CMD_TYPE, block=False)
                 cmd = decode_msg(raw)
                 running = handle_display_command(mq, state, cmd)
+                if running == 2 : 
+                    new_pid = spawn_prey(children)
+                    print(f"[env] BIRTH PREY -> spawned pid={new_pid}")
+                if running == 3 :
+                    new_pid = spawn_predator(children)
+                    print(f"[env] BIRTH PREDATOR -> spawned pid={new_pid}")
             except sysv_ipc.BusyError:
                 pass
 
