@@ -21,6 +21,7 @@ CMD_TYPE = 1
 HOST = "127.0.0.1"
 PORT = 1789
 
+DROUGHT_DURATION = 20
 G = 10                 # herbe consommée par un prey quand il FEED
 TICK_SLEEP = 0.2       # pas de simulation
 
@@ -72,6 +73,10 @@ def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> 
     if action == "ADD_PREDATOR":
         mq.send(b"OK adding predator", type=sender_pid)
         return 3
+    
+    if action == "ADD_DROUGHT":
+        mq.send(b"OK adding DROUGHT", type=sender_pid)
+        return 4
     
     mq.send(f"ERR unknown action {action}".encode("utf-8"), type=sender_pid)
     return True
@@ -136,6 +141,7 @@ def main() -> int:
         "preys": 0,
         "grass": 100,
         "drought": False,
+        "droughttick": 0
     }
     # --- processus enfants de env ---
     children: list[mp.Process] = []
@@ -176,7 +182,12 @@ def main() -> int:
             state["tick"] += 1
             if not state["drought"]:
                 state["grass"] += 1
-
+            if state["drought"]:
+                state["droughttick"] +=1
+            if state["droughttick"] >= DROUGHT_DURATION:
+                state["drought"] = False
+                state["droughttick"] = 0
+                print("End of drought") 
             # ---- display MQ (non-blocking) ----
             try:
                 raw, _t = mq.receive(type=CMD_TYPE, block=False)
@@ -188,6 +199,8 @@ def main() -> int:
                 if running == 3 :
                     new_pid = spawn_predator(children)
                     print(f"[env] BIRTH PREDATOR -> spawned pid={new_pid}")
+                if running == 4 :
+                    state["drought"] = True
             except sysv_ipc.BusyError:
                 pass
 
