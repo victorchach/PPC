@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
+# predator.py
 import os
 import time
 import socket
 import random
+from multiprocessing import shared_memory
+import struct
 
-# valeurs par défaut (quand tu lances predator.py à la main)
 HOST = "127.0.0.1"
 PORT = 1789
 
-# seuils
 H = 50
 R = 75
-E_GAIN = 80     # gain d'énergie quand il mange une proie
-E_DECAY = 7     # perte d'énergie par tick
-
+E_GAIN = 80
+E_DECAY = 7
 TICK_SLEEP = 0.2
+
+SHM_NAME = "circle_of_life_state"
+SHM_FMT = "iiiii"
+SHM_SIZE = struct.calcsize(SHM_FMT)
 
 
 def recv_line(sock: socket.socket) -> str:
@@ -33,62 +37,59 @@ def send_line(sock: socket.socket, s: str) -> str:
 
 
 def agent_main(host: str, port: int, H_: int, R_: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
-    """
-    La logique predator, mais paramétrable.
-    -> env.py pourra lancer ça dans un nouveau process via multiprocessing.
-    """
     pid = os.getpid()
     print(f"[predator] PID={pid} starting")
 
-    state = {
-        "tick": 0,
-        "energy": 120,
-        "active": True,
-    }
+    shm = None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((host, port))
+            resp = send_line(s, f"JOIN PREDATOR {pid}")
+            print(f"[predator] env: {resp}")
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.connect((host, port))
+            # SHM attach (read-only snapshot)
+            try:
+                shm = shared_memory.SharedMemory(name=SHM_NAME)
+                tick, predators, preys, grass, drought_i = struct.unpack(SHM_FMT, shm.buf[:SHM_SIZE])
+                print(
+                    f"[predator] shm snapshot: "
+                    f"tick={tick} preys={preys} predators={predators} drought={bool(drought_i)}"
+                )
+            except FileNotFoundError:
+                print("[predator] shm not found (env not started?)")
 
-        # JOIN
-        resp = send_line(s, f"JOIN PREDATOR {pid}")
-        print(f"[predator] env: {resp}")
+            energy = 120
 
-        try:
             while True:
-                state["tick"] += 1
+                active = (random.random() < 0.6)
+                energy -= e_decay
 
-                # actif/passif (simple)
-                state["active"] = (random.random() < 0.6)
-                state["energy"] -= e_decay
-
-                # mort
-                if state["energy"] < 0:
+                if energy < 0:
                     resp = send_line(s, f"DIE PREDATOR {pid}")
-                    print(f"[predator] env: {resp} -> exiting (energy={state['energy']})")
+                    print(f"[predator] env: {resp} -> exiting (energy={energy})")
                     break
 
-                # reproduction
-                if state["active"] and state["energy"] > R_:
+                if active and energy > R_:
                     resp = send_line(s, f"REPRO PREDATOR {pid}")
                     print(f"[predator] env: {resp}")
-                    # coût d'énergie optionnel
-                    state["energy"] -= 15
+                    energy -= 15
 
-                # feed (manger une proie)
-                if state["active"] and state["energy"] < H_:
+                if active and energy < H_:
                     resp = send_line(s, f"FEED PREDATOR {pid}")
                     print(f"[predator] env: {resp}")
                     if resp.startswith("OK"):
-                        state["energy"] += e_gain
+                        energy += e_gain
 
                 time.sleep(tick_sleep)
 
-        except KeyboardInterrupt:
-            print("\n[predator] KeyboardInterrupt -> exiting")
+    except KeyboardInterrupt:
+        print("\n[predator] KeyboardInterrupt -> exiting")
+    finally:
+        if shm is not None:
+            shm.close()
 
 
 def main() -> int:
-    # quand tu lances "python3 predator.py", tu gardes le même comportement qu'avant
     agent_main(HOST, PORT, H, R, E_GAIN, E_DECAY, TICK_SLEEP)
     return 0
 
