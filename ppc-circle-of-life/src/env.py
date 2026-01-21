@@ -344,7 +344,7 @@ def main() -> int:
 
                     if cmd == "FEED":
                         if kind == "PREY":
-                            if state["grass"] >= G and not state["drought"]:
+                            if state["grass"] >= G :
                                 state["grass"] -= G
                                 cs.sendall(encode_msg("OK FEED GRASS"))
                                 if DEBUG:
