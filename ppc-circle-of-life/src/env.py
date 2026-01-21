@@ -355,11 +355,14 @@ def main() -> int:
 
                     if cmd == "FEED":
                         if kind == "PREY":
-                            if state["grass"] >= G :
-                                state["grass"] -= G
+                            # Les proies peuvent manger même pendant la sécheresse
+                            # mais la quantité d'herbe diminue de toute façon
+                            if state["grass"] > 0:
+                                amount_to_eat = min(G, state["grass"])
+                                state["grass"] -= amount_to_eat
                                 cs.sendall(encode_msg("OK FEED GRASS"))
                                 if DEBUG:
-                                    print(f"[env] prey pid={pid} ate grass (-{G})")
+                                    print(f"[env] prey pid={pid} ate grass (-{amount_to_eat})")
                             else:
                                 cs.sendall(encode_msg("NO NO_GRASS"))
                             continue
