@@ -6,6 +6,7 @@ import time
 import socket
 import select
 import signal
+import random
 from typing import Dict, Tuple
 import multiprocessing as mp
 from multiprocessing import shared_memory, Lock
@@ -25,6 +26,10 @@ PORT = 1789
 DROUGHT_DURATION = 20
 G = 10
 TICK_SLEEP = 0.2
+
+# Taux de réussite de reproduction
+PREY_REPRO_SUCCESS_RATE = 2/3
+PREDATOR_REPRO_SUCCESS_RATE = 1/3
 
 DEBUG = True
 
@@ -59,7 +64,7 @@ def encode_msg(s: str) -> bytes:
 def decode_msg(b: bytes) -> str:
     return b.decode("utf-8", errors="replace")
 
-def shm_write(shm: shared_memory.SharedMemory, lock: Lock,
+def shm_write(shm, lock,
               tick: int, predators: int, preys: int, grass: int, drought: bool) -> None:
     """Mettre à jour la shared memory avec les nouvelles valeurs."""
     with lock:
@@ -331,13 +336,19 @@ def main() -> int:
                         if len(repro_ready[kind]) >= 2:
                             parent1 = repro_ready[kind].pop()
                             parent2 = repro_ready[kind].pop()
-                            if kind == "PREY":
-                                new_pid = spawn_prey(children)
-                                print(f"[env] BIRTH PREY: parents=({parent1},{parent2}) -> pid={new_pid}")
+                            # Appliquer le taux de réussite de reproduction
+                            success_rate = PREY_REPRO_SUCCESS_RATE if kind == "PREY" else PREDATOR_REPRO_SUCCESS_RATE
+                            if random.random() < success_rate:
+                                if kind == "PREY":
+                                    new_pid = spawn_prey(children)
+                                    print(f"[env] BIRTH PREY: parents=({parent1},{parent2}) -> pid={new_pid}")
+                                else:
+                                    new_pid = spawn_predator(children)
+                                    print(f"[env] BIRTH PREDATOR: parents=({parent1},{parent2}) -> pid={new_pid}")
+                                cs.sendall(encode_msg("OK REPRO BIRTH"))
                             else:
-                                new_pid = spawn_predator(children)
-                                print(f"[env] BIRTH PREDATOR: parents=({parent1},{parent2}) -> pid={new_pid}")
-                            cs.sendall(encode_msg("OK REPRO BIRTH"))
+                                print(f"[env] REPRO FAILED {kind}: parents=({parent1},{parent2})")
+                                cs.sendall(encode_msg("OK REPRO FAILED"))
                         else:
                             cs.sendall(encode_msg("OK REPRO WAITING"))
                         continue
