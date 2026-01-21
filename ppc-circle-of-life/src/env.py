@@ -28,6 +28,8 @@ TICK_SLEEP = 0.2
 
 DEBUG = True
 
+shm = None  # Variable globale pour la shared memory
+lock = None  # Variable globale pour le lock
 # -----------------------
 # SHARED MEMORY
 # -----------------------
@@ -35,23 +37,35 @@ SHM_NAME = "circle_of_life_state"
 SHM_FMT = "iiiii"  # tick, predators, preys, grass, drought(0/1)
 SHM_SIZE = struct.calcsize(SHM_FMT)
 
+# -----------------------
+# STATE GLOBAL
+# -----------------------
+state = {
+    "tick": 0,
+    "predators": 0,
+    "preys": 0,
+    "grass": 100,
+    "drought": False,
+    "droughttick": 0,
+}
+
+# -----------------------
+# FUNCTIONS
+# -----------------------
 
 def encode_msg(s: str) -> bytes:
     return (s + "\n").encode("utf-8")
 
-
 def decode_msg(b: bytes) -> str:
     return b.decode("utf-8", errors="replace")
 
-
 def shm_write(shm: shared_memory.SharedMemory, lock: Lock,
               tick: int, predators: int, preys: int, grass: int, drought: bool) -> None:
-    # lock local à env (agents lisent sans lock -> best effort)
+    """Mettre à jour la shared memory avec les nouvelles valeurs."""
     with lock:
         shm.buf[:SHM_SIZE] = struct.pack(SHM_FMT, tick, predators, preys, grass, int(drought))
 
-
-def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> int:
+def handle_display_command(mq: sysv_ipc.MessageQueue, cmd: str) -> int:
     """
     Format: "<PID> <ACTION>"
     ACTION: STATUS | QUIT | ADD_PREY | ADD_PREDATOR | ADD_DROUGHT
@@ -96,12 +110,22 @@ def handle_display_command(mq: sysv_ipc.MessageQueue, state: dict, cmd: str) -> 
         return 3
 
     if action == "ADD_DROUGHT":
-        mq.send(b"OK adding DROUGHT", type=sender_pid)
+        print("[env] Drought triggered by display.")
+        # Remplaçons os.kill par signal.raise_signal ici
+        signal.raise_signal(signal.SIGUSR1)  # Cela envoie le signal à env.py
+        mq.send(b"OK drought", type=sender_pid)
         return 4
 
     mq.send(f"ERR unknown action {action}".encode("utf-8"), type=sender_pid)
     return 1
 
+def handle_drought_signal(signum, frame):
+    """ Signal handler qui active la sécheresse. """
+    global state  # Utilisation de la variable globale `state`
+    print("[env] Drought started!")
+    state["drought"] = True
+    # Mettre à jour la shared memory avec la nouvelle valeur de drought
+    shm_write(shm, lock, state["tick"], state["predators"], state["preys"], state["grass"], state["drought"])
 
 def safe_kill(pid: int, who: str) -> None:
     try:
@@ -111,7 +135,6 @@ def safe_kill(pid: int, who: str) -> None:
         print(f"[env] PID {pid} already dead ({who})")
     except PermissionError:
         print(f"[env] no permission to kill PID {pid} ({who})")
-
 
 def parse_line(line: str) -> Tuple[str, str, int]:
     """
@@ -131,18 +154,18 @@ def parse_line(line: str) -> Tuple[str, str, int]:
         raise ValueError(f"unknown kind: {kind}")
     return cmd, kind, pid
 
-
 def run_prey_proc(host: str, port: int, H: int, R: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
     from prey import agent_main
     agent_main(host, port, H, R, e_gain, e_decay, tick_sleep)
-
 
 def run_predator_proc(host: str, port: int, H: int, R: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
     from predator import agent_main
     agent_main(host, port, H, R, e_gain, e_decay, tick_sleep)
 
-
 def main() -> int:
+
+    global shm, lock  # Rendre shm et lock accessibles dans toute la fonction main
+
     print(f"[env] PID={os.getpid()} starting")
 
     mq = sysv_ipc.MessageQueue(MQ_KEY, sysv_ipc.IPC_CREAT)
@@ -154,16 +177,6 @@ def main() -> int:
     server.listen(50)
     server.setblocking(False)
     print(f"[env] Socket server listening on {HOST}:{PORT}")
-
-    # --- Local State ---
-    state = {
-        "tick": 0,
-        "predators": 0,
-        "preys": 0,
-        "grass": 100,
-        "drought": False,
-        "droughttick": 0,
-    }
 
     # --- Shared memory init ---
     lock = Lock()
@@ -206,6 +219,8 @@ def main() -> int:
 
     running = 1
     try:
+        signal.signal(signal.SIGUSR1, handle_drought_signal)
+
         while running != 0:
             # ---- simulation tick ----
             state["tick"] += 1
@@ -224,7 +239,7 @@ def main() -> int:
             try:
                 raw, _t = mq.receive(type=CMD_TYPE, block=False)
                 cmd = decode_msg(raw)
-                running = handle_display_command(mq, state, cmd)
+                running = handle_display_command(mq, cmd)
 
                 if running == 2:
                     new_pid = spawn_prey(children)
@@ -235,9 +250,9 @@ def main() -> int:
                     print(f"[env] SPAWN PREDATOR -> pid={new_pid}")
                     running = 1
                 elif running == 4:
-                    state["drought"] = True
-                    state["droughttick"] = 0
-                    print("[env] Drought started")
+                    print("[env] Drought triggered by display.")
+                    # Appeler directement la fonction handle_drought_signal() pour gérer la sécheresse
+                    handle_drought_signal(signal.SIGUSR1, None)  # envoie le signal à env pour activer la sécheresse
                     running = 1
             except sysv_ipc.BusyError:
                 pass
