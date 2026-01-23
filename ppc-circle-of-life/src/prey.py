@@ -4,11 +4,19 @@ import os
 import time
 import socket
 import random
-from multiprocessing import shared_memory
 import struct
+from multiprocessing import shared_memory
+import sysv_ipc
 
 HOST = "127.0.0.1"
 PORT = 1789
+
+SHM_NAME = "circle_of_life_state"
+SHM_FMT = "iiiii"  # tick, predators, preys, grass, drought
+SHM_SIZE = struct.calcsize(SHM_FMT)
+
+SEM_KEY = 222
+G = 10
 
 H = 50
 R = 75
@@ -16,12 +24,7 @@ E_GAIN = 50
 E_DECAY = 5
 TICK_SLEEP = 0.2
 
-SHM_NAME = "circle_of_life_state"
-SHM_FMT = "iiiii"
-SHM_SIZE = struct.calcsize(SHM_FMT)
-
-
-def recv_line(sock: socket.socket) -> str:
+def recv_line(sock):
     data = b""
     while b"\n" not in data:
         chunk = sock.recv(1024)
@@ -30,66 +33,81 @@ def recv_line(sock: socket.socket) -> str:
         data += chunk
     return data.split(b"\n", 1)[0].decode("utf-8", errors="replace").strip()
 
-
-def send_line(sock: socket.socket, s: str) -> str:
+def send_line(sock, s):
     sock.sendall((s + "\n").encode("utf-8"))
     return recv_line(sock)
 
+def unpack(buf):
+    return struct.unpack(SHM_FMT, buf[:SHM_SIZE])
 
-def agent_main(host: str, port: int, H_: int, R_: int, e_gain: int, e_decay: int, tick_sleep: float) -> None:
+def pack(tick, predators, preys, grass, drought):
+    return struct.pack(SHM_FMT, tick, predators, preys, grass, drought)
+
+def agent_main(host, port):
     pid = os.getpid()
     print(f"[prey] PID={pid} starting")
 
-    shm = None  # important pour le finally
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.connect((host, port))
-            resp = send_line(s, f"JOIN PREY {pid}")
-            print(f"[prey] env: {resp}")
+    sem = sysv_ipc.Semaphore(SEM_KEY)
+    shm = shared_memory.SharedMemory(name=SHM_NAME)
 
-            # SHM attach (read-only snapshot)
-            try:
-                shm = shared_memory.SharedMemory(name=SHM_NAME)
-                tick, predators, preys, grass, drought_i = struct.unpack(SHM_FMT, shm.buf[:SHM_SIZE])
-                print(f"[prey] shm snapshot: tick={tick} grass={grass} drought={bool(drought_i)}")
-            except FileNotFoundError:
-                print("[prey] shm not found (env not started?)")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.connect((host, port))
+        print("[prey] env:", send_line(s, f"JOIN PREY {pid}"))
 
-            energy = 100
+        # increment population in SHM (agent does it)
+        sem.acquire()
+        try:
+            tick, predators, preys, grass, drought = unpack(shm.buf)
+            preys += 1
+            shm.buf[:SHM_SIZE] = pack(tick, predators, preys, grass, drought)
+        finally:
+            sem.release()
 
-            while True:
-                active = (random.random() < 0.6)
-                energy -= e_decay
+        energy = 100
 
-                if energy < 0:
-                    resp = send_line(s, f"DIE PREY {pid}")
-                    print(f"[prey] env: {resp} -> exiting (energy={energy})")
-                    break
+        while True:
+            active = (random.random() < 0.6)
+            energy -= E_DECAY
 
-                if active and energy > R_:
-                    resp = send_line(s, f"REPRO PREY {pid}")
-                    print(f"[prey] env: {resp}")
-                    energy -= 10
+            if energy < 0:
+                # die => decrement preys in SHM
+                sem.acquire()
+                try:
+                    tick, predators, preys, grass, drought = unpack(shm.buf)
+                    preys = max(0, preys - 1)
+                    shm.buf[:SHM_SIZE] = pack(tick, predators, preys, grass, drought)
+                finally:
+                    sem.release()
+                print(f"[prey] died energy={energy}")
+                break
 
-                if active and energy < H_:
-                    resp = send_line(s, f"FEED PREY {pid}")
-                    print(f"[prey] env: {resp}")
-                    if resp.startswith("OK"):
-                        energy += e_gain
+            # FEED directly from SHM
+            if active and energy < H:
+                sem.acquire()
+                try:
+                    tick, predators, preys, grass, drought = unpack(shm.buf)
+                    if (not drought) and grass >= G:
+                        grass -= G
+                        shm.buf[:SHM_SIZE] = pack(tick, predators, preys, grass, drought)
+                        energy += E_GAIN
+                        # debug
+                        # print(f"[prey] ate grass (-{G})")
+                finally:
+                    sem.release()
 
-                time.sleep(tick_sleep)
+            # REPRO via socket (env spawns; SHM population increment happens in child on JOIN)
+            if active and energy > R:
+                resp = send_line(s, f"REPRO PREY {pid}")
+                # print("[prey] repro:", resp)
+                energy -= 10
 
-    except KeyboardInterrupt:
-        print("\n[prey] KeyboardInterrupt -> exiting")
-    finally:
-        if shm is not None:
-            shm.close()
+            time.sleep(TICK_SLEEP)
 
+    shm.close()
 
-def main() -> int:
-    agent_main(HOST, PORT, H, R, E_GAIN, E_DECAY, TICK_SLEEP)
+def main():
+    agent_main(HOST, PORT)
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
