@@ -44,35 +44,40 @@ def unpack(buf):
 def pack(tick, predators, preys, grass, drought):
     return struct.pack(SHM_FMT, tick, predators, preys, grass, drought)
 
-def run_predator_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
-    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
+def run_predator_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey)
 
-def spawn_predator(children, prey_pid_list, repro_ready_predator, repro_ready_prey):
-    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
+def spawn_predator(children, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
+    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey), daemon=False)
     p.start()
     children.append(p)
     return p.pid
 
-def removeLIST(lst, valeur): #Supprime 'valeur' de la liste partagée si présent.
-    try:
-        while True:
-            lst.remove(valeur)
-    except ValueError:
-        pass
+def removeLIST(lst, lock, valeur):
+    with lock:
+        try:
+            while True:
+                lst.remove(valeur)
+        except ValueError:
+            pass
 
-def longueurLIST(lst):
-    return len(lst)
+def value_inLIST(lst, lock, valeur):
+    with lock:
+        return valeur in lst
 
-def random_valueLIST(lst): #renvoie un valeure random de la manager.liste() list
-    snap = list(lst)
-    if len(snap) == 0:
-        return None
-    return random.choice(snap)
+def pop_random_valueLIST(lst, lock): #choisit un élément au hasard ET le retire de la Manager().list() sous le même lock. Retourne None si liste vide.
+    with lock:
+        n = len(lst)
+        if n == 0:
+            return None
+        idx = random.randrange(n)
+        pid = lst[idx]
+        # retrait atomique (toujours sous lock)
+        lst.pop(idx)
+        return pid
 
-def value_inLIST(lst, valeur): #renvoi true si valeur est dans lst, false sinon 
-    return valeur in list(lst)
 
-def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
+def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
     pid = os.getpid()
     print(f"[predator] PID={pid} starting")
     children = []
@@ -107,7 +112,7 @@ def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey
                 finally:
                     sem.release()
                 print(f"[predator] died energy={energy}")
-                removeLIST(repro_ready_predator, os.getpid())
+                removeLIST(repro_ready_predator, lock_repro_predator, os.getpid())
                 os.kill(os.getpid(), signal.SIGTERM)  # Terminates the process
                 break
 
@@ -119,15 +124,21 @@ def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey
                     tick, predators, preys, grass, drought = unpack(shm.buf)
                     if preys > 0 :
                         # Choisir une proie au hasard
-                        prey_pid = random_valueLIST(prey_pid_list)  # prendre un PID au hasard
-                        
+                        prey_pid = pop_random_valueLIST(prey_pid_list, lock_prey_pid_list)  # ATOMIQUE
+
                         if prey_pid is not None:
-                            os.kill(prey_pid, signal.SIGTERM)
-                            removeLIST(prey_pid_list, prey_pid)
-                            removeLIST(repro_ready_prey, prey_pid)
+                            try:
+                                os.kill(prey_pid, signal.SIGTERM)
+                            except ProcessLookupError:
+                                # PID déjà mort => on considère "pas mangé"
+                                prey_pid = None
+
+                        if prey_pid is not None:
+                            removeLIST(repro_ready_prey, lock_repro_prey, prey_pid)  # nettoyage repro list
                             preys = max(0, preys - 1)
                             shm.buf[:SHM_SIZE] = pack(tick, predators, preys, grass, drought)
                             ate = True
+
                 finally:
                     sem.release()
 
@@ -137,17 +148,18 @@ def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey
 
             # REPRO
             if energy > R:
-                if value_inLIST(repro_ready_predator, os.getpid()) == False : 
-                    repro_ready_predator.append(os.getpid())
-                
-                if longueurLIST(repro_ready_predator) >= 2:
-                    p1 = repro_ready_predator.pop(0)
-                    p2 = repro_ready_predator.pop(0)
-                    new_pid = spawn_predator(children, prey_pid_list, repro_ready_predator, repro_ready_prey)
-                    print(f"[prey] birth PREDATOR pid={new_pid} parents=({p1},{p2})")
+                with lock_repro_predator:
+                    if os.getpid() not in repro_ready_predator:
+                        repro_ready_predator.append(os.getpid())
     
-                else:
-                    print("OK PREDATOR REPRO WAITING")
+                    if len(repro_ready_predator) >= 2:
+                        p1 = repro_ready_predator.pop(0)
+                        p2 = repro_ready_predator.pop(0)
+                        new_pid = spawn_predator(children, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey)
+                        print(f"[prey] birth PREDATOR pid={new_pid} parents=({p1},{p2})")
+    
+                    else:
+                        print("OK PREDATOR REPRO WAITING")
                 energy -= 15
 
             time.sleep(TICK_SLEEP)

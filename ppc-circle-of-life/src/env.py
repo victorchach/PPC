@@ -30,9 +30,15 @@ DEBUG = True
 
 # Manager().list() pour gérer les pid des Preys (dynamique)
 manager = None
+
 prey_pid_list = None
 repro_ready_prey = None
 repro_ready_predator = None
+
+lock_prey_pid_list = None
+lock_repro_prey = None
+lock_repro_predator = None
+
 # -----------------------
 # SHARED MEMORY
 # -----------------------
@@ -103,23 +109,24 @@ def parse_line(line):
         raise ValueError("kind must be PREY or PREDATOR")
     return cmd, kind, pid
 
-def run_prey_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
+def run_prey_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
     from prey import agent_main
-    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey)
 
-def run_predator_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
+def run_predator_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
     from predator import agent_main
-    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey)
 
 def spawn_prey(children):
-    p = mp.Process(target=run_prey_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
+    p = mp.Process(target=run_prey_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey), daemon=False)
     p.start()
     children.append(p)
-    prey_pid_list.append(p.pid)  # Ajouter le PID de la proie dans la manager.list
+    with lock_prey_pid_list : 
+        prey_pid_list.append(p.pid)  # Ajouter le PID de la proie dans la manager.list
     return p.pid
 
 def spawn_predator(children):
-    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
+    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey), daemon=False)
     p.start()
     children.append(p)
     return p.pid
@@ -280,7 +287,9 @@ def thread_display(mq, children, stop_event):
 
 
 def main():
-    global shm, sem, drought_tick,manager, prey_pid_list, repro_ready_predator, repro_ready_prey
+    global shm, sem, drought_tick
+    global manager, prey_pid_list, repro_ready_predator, repro_ready_prey
+    global lock_prey_pid_list, lock_repro_prey, lock_repro_predator
 
     print(f"[env] PID={os.getpid()} starting")
 
@@ -302,10 +311,16 @@ def main():
 
     shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHM_SIZE)
     
+
     manager = mp.Manager()
+
     prey_pid_list = manager.list()
     repro_ready_prey = manager.list()
     repro_ready_predator = manager.list()
+
+    lock_prey_pid_list = manager.Lock()
+    lock_repro_prey = manager.Lock()
+    lock_repro_predator = manager.Lock()
 
     with ShmGuard(sem):
         shm.buf[:SHM_SIZE] = shm_pack(0, 0, 0, 100, 0)

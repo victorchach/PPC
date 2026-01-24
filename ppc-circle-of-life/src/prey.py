@@ -45,30 +45,30 @@ def unpack(buf):
 def pack(tick, predators, preys, grass, drought):
     return struct.pack(SHM_FMT, tick, predators, preys, grass, drought)
 
-def run_prey_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
-    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
+def run_prey_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey)
 
-def spawn_prey(children, prey_pid_list, repro_ready_predator, repro_ready_prey):
-    p = mp.Process(target=run_prey_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
+def spawn_prey(children, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
+    p = mp.Process(target=run_prey_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey), daemon=False)
     p.start()
     children.append(p)
-    prey_pid_list.append(p.pid)  # Ajouter le PID de la proie dans la manager.list()
+    with lock_prey_pid_list :
+        prey_pid_list.append(p.pid)  # Ajouter le PID de la proie dans la manager.list()
     return p.pid
 
-def removeLIST(lst, valeur): #Supprime 'valeur' de la liste partagée si présent.
-    try:
-        while True:
-            lst.remove(valeur)
-    except ValueError:
-        pass
+def removeLIST(lst, lock, valeur):
+    with lock:
+        try:
+            while True:
+                lst.remove(valeur)
+        except ValueError:
+            pass
 
-def longueurLIST(lst):
-    return len(lst)
+def value_inLIST(lst, lock, valeur):
+    with lock:
+        return valeur in lst
 
-def value_inLIST(lst, valeur): #renvoi true si valeur est dans lst, false sinon 
-    return valeur in list(lst)
-
-def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
+def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey):
     pid = os.getpid()
     print(f"[prey] PID={pid} starting")
     children = []
@@ -103,8 +103,8 @@ def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey
                 finally:
                     sem.release()
                 print(f"[prey] died energy={energy}")
-                removeLIST(prey_pid_list, os.getpid())  # on s'enlève de la manager.list() des pid
-                removeLIST(repro_ready_prey, os.getpid())
+                removeLIST(prey_pid_list, lock_prey_pid_list, os.getpid())  # on s'enlève de la manager.list() des pid
+                removeLIST(repro_ready_prey, lock_repro_prey, os.getpid())
                 os.kill(os.getpid(), signal.SIGTERM)  # Terminates the process
                 
                 break
@@ -125,17 +125,18 @@ def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey
 
             # REPRO via socket (env spawns; SHM population increment happens in child on JOIN)
             if energy > R:
-                if value_inLIST(repro_ready_prey, os.getpid()) == False :
-                    repro_ready_prey.append(os.getpid())
+                with lock_repro_prey:
+                    if os.getpid() not in repro_ready_prey:
+                        repro_ready_prey.append(os.getpid())
 
-                if longueurLIST(repro_ready_prey) >= 2:
-                    p1 = repro_ready_prey.pop(0)
-                    p2 = repro_ready_prey.pop(0)
-                    new_pid = spawn_prey(children, prey_pid_list, repro_ready_predator, repro_ready_prey)
-                    print(f"[prey] birth PREY pid={new_pid} parents=({p1},{p2})")
+                    if len(repro_ready_prey) >= 2:
+                        p1 = repro_ready_prey.pop(0)
+                        p2 = repro_ready_prey.pop(0)   
+                        new_pid = spawn_prey(children, prey_pid_list, repro_ready_predator, repro_ready_prey, lock_prey_pid_list, lock_repro_predator, lock_repro_prey)
+                        print(f"[prey] birth PREY pid={new_pid} parents=({p1},{p2})")
     
-                else:
-                    print("[prey] OK PREY REPRO WAITING")
+                    else:
+                        print("[prey] OK PREY REPRO WAITING")
                 
                 energy -= 25
                 continue
