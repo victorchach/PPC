@@ -62,14 +62,17 @@ class ShmGuard:
         self.sem.release()
         return False
 
+# -----------------------
+# Reproduction registry (env only)
+# -----------------------
+repro_ready = {"PREY": set(), "PREDATOR": set()}
+
 # Drought internal counter (env only)
 drought_tick = 0
 
 # Globals set in main
 shm = None
 sem = None
-
-stop_event = threading.Event()  # Event to stop all threads
 
 def handle_drought_signal(signum, frame):
     """SIGUSR1 => start drought (set drought=1 in SHM)"""
@@ -173,8 +176,65 @@ def handle_display_command(mq, children, cmd):
 #   DEFINITION DES THREADS
 #-----------------------------
 
-def thread_simulation(shm, sem, drought_tick):
-    while not stop_event.is_set():
+def thread_simulation():
+
+
+
+def thread_socket():
+
+
+
+def thread_socket():
+
+
+    
+def main():
+    global shm, sem, drought_tick, prey_pid_queue, repro_ready_predator, repro_ready_prey
+
+    print(f"[env] PID={os.getpid()} starting")
+
+    # MQ
+    mq = sysv_ipc.MessageQueue(MQ_KEY, sysv_ipc.IPC_CREAT)
+    print(f"[env] MessageQueue created key={MQ_KEY}")
+
+    # Semaphore (SysV) for SHM
+    sem = sysv_ipc.Semaphore(SEM_KEY, sysv_ipc.IPC_CREAT, initial_value=1)
+    print(f"[env] Semaphore created key={SEM_KEY}")
+
+    # Shared memory & pid_prey_queue init 
+    try:
+        old = shared_memory.SharedMemory(name=SHM_NAME, create=False)
+        old.close()
+        old.unlink()
+    except FileNotFoundError:
+        pass
+
+    shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHM_SIZE)
+    prey_pid_queue = mp.Queue()
+    repro_ready_prey = mp.Queue()
+    repro_ready_predator = mp.Queue()
+
+    with ShmGuard(sem):
+        shm.buf[:SHM_SIZE] = shm_pack(0, 0, 0, 100, 0)
+
+    # Signal
+    signal.signal(signal.SIGUSR1, handle_drought_signal)
+
+    # Socket server for JOIN/REPRO
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(50)
+    server.setblocking(False)
+    print(f"[env] socket listening {HOST}:{PORT}")
+
+    children = []
+    clients = set()
+    recv_buf = {}
+
+    running = True
+    try:
+        while running:
             # ---- global tick & grass growth & drought duration ----
             with ShmGuard(sem):
                 tick, predators, preys, grass, drought = shm_unpack(shm.buf)
@@ -190,12 +250,18 @@ def thread_simulation(shm, sem, drought_tick):
                     grass += GRASS_GROWTH
 
                 shm.buf[:SHM_SIZE] = shm_pack(tick, predators, preys, grass, drought)
-            time.sleep(TICK_SLEEP)
 
+            # ---- display MQ ----
+            try:
+                raw, _t = mq.receive(type=CMD_TYPE, block=False)
+                cmd = decode_bytes(raw)
+                keep = handle_display_command(mq, children, cmd)
+                if keep == 0:
+                    running = False
+            except sysv_ipc.BusyError:
+                pass
 
-def thread_socket(server, clients, recv_buf):
-    while not stop_event.is_set():
-    # ---- socket multiplexing ----
+            # ---- socket multiplexing ----
             rlist = [server] + list(clients)
             readable, _, exceptional = select.select(rlist, [], rlist, 0)
 
@@ -263,75 +329,8 @@ def thread_socket(server, clients, recv_buf):
                 except Exception:
                     pass
 
+            time.sleep(TICK_SLEEP)
 
-def thread_display(mq, children, stop_event):
-    while not stop_event.is_set():
-        # ---- display MQ ----
-            try:
-                raw, _t = mq.receive(type=CMD_TYPE, block=False)
-                cmd = decode_bytes(raw)
-                keep = handle_display_command(mq, children, cmd)
-                if keep == 0:
-                    stop_event.set()
-            except sysv_ipc.BusyError:
-                pass
-
-
-
-def main():
-    global shm, sem, drought_tick, prey_pid_queue, repro_ready_predator, repro_ready_prey
-
-    print(f"[env] PID={os.getpid()} starting")
-
-    # MQ
-    mq = sysv_ipc.MessageQueue(MQ_KEY, sysv_ipc.IPC_CREAT)
-    print(f"[env] MessageQueue created key={MQ_KEY}")
-
-    # Semaphore (SysV) for SHM
-    sem = sysv_ipc.Semaphore(SEM_KEY, sysv_ipc.IPC_CREAT, initial_value=1)
-    print(f"[env] Semaphore created key={SEM_KEY}")
-
-    # Shared memory & pid_prey_queue init 
-    try:
-        old = shared_memory.SharedMemory(name=SHM_NAME, create=False)
-        old.close()
-        old.unlink()
-    except FileNotFoundError:
-        pass
-
-    shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHM_SIZE)
-    prey_pid_queue = mp.Queue()
-    repro_ready_prey = mp.Queue()
-    repro_ready_predator = mp.Queue()
-
-    with ShmGuard(sem):
-        shm.buf[:SHM_SIZE] = shm_pack(0, 0, 0, 100, 0)
-
-    # Signal
-    signal.signal(signal.SIGUSR1, handle_drought_signal)
-
-    # Socket server for JOIN/REPRO
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen(50)
-    server.setblocking(False)
-    print(f"[env] socket listening {HOST}:{PORT}")
-
-    children = []
-    clients = set()
-    recv_buf = {}
-
-    # Start threads
-    threading.Thread(target=thread_simulation, args=(shm, sem, drought_tick), daemon=False).start()
-    threading.Thread(target=thread_socket, args=(server, clients, recv_buf), daemon=False).start()
-    threading.Thread(target=thread_display, args=(mq, children, stop_event), daemon=False).start()
-
-    # Keep the main process alive
-    try:
-        while True:
-            time.sleep(1)
-    
     except KeyboardInterrupt:
         print("\n[env] KeyboardInterrupt")
 
