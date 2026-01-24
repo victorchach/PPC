@@ -44,63 +44,35 @@ def unpack(buf):
 def pack(tick, predators, preys, grass, drought):
     return struct.pack(SHM_FMT, tick, predators, preys, grass, drought)
 
-def run_predator_proc(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey):
-    agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey)
+def run_predator_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
 
-def spawn_predator(children, prey_pid_queue, repro_ready_predator, repro_ready_prey):
-    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_queue, repro_ready_predator, repro_ready_prey), daemon=False)
+def spawn_predator(children, prey_pid_list, repro_ready_predator, repro_ready_prey):
+    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
     p.start()
     children.append(p)
     return p.pid
 
-def removeQUEUE(queue, valeur): # on prend une queue et une valeur, on renvoie une queue avec cette valeur supprimée
-    temp_list = []
-    
-    while not queue.empty():
-        temp_list.append(queue.get())
+def removeLIST(lst, valeur): #Supprime 'valeur' de la liste partagée si présent.
+    try:
+        while True:
+            lst.remove(valeur)
+    except ValueError:
+        pass
 
-    temp_list = [i for i in temp_list if i != valeur]
+def longueurLIST(lst):
+    return len(lst)
 
-    for i in temp_list:
-        queue.put(i)
+def random_valueLIST(lst): #renvoie un valeure random de la manager.liste() list
+    snap = list(lst)
+    if len(snap) == 0:
+        return None
+    return random.choice(snap)
 
-def random_valueQUEUE(queue): # sélectionne aléatoirement une valeur dans une queue
-    temp_list = []
-    cpy_queue = queue
-    while not cpy_queue.empty():
-        temp_list.append(cpy_queue.get())
-    
-    if len(temp_list) == 0:
-        print("[WARNING] Queue is empty, unable to select a random value.")
-        return None  # ou autre valeur par défaut
+def value_inLIST(lst, valeur): #renvoi true si valeur est dans lst, false sinon 
+    return valeur in list(lst)
 
-    if len(temp_list) == 1:
-        return temp_list[0]
-    else:
-        random_index = random.randint(0, len(temp_list) - 1)
-        return temp_list[random_index]
-
-def longueurQUEUE(queue):
-    temp_list = []
-    queue_cpy = queue
-    if not queue_cpy.empty() :
-        while not queue_cpy.empty():
-            temp_list.append(queue_cpy.get())
-        return len(temp_list)
-    else: 
-        return 0
-
-def value_inQUEUE(queue, valeur): # renvoie true si valeur est dans queue, False sinon
-    temp_list = []
-    cpy_queue = queue
-    while not cpy_queue.empty():
-        temp_list.append(cpy_queue.get())
-    for i in temp_list :
-        if i == valeur :
-            return True
-    return False
-
-def agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey):
+def agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
     pid = os.getpid()
     print(f"[predator] PID={pid} starting")
     children = []
@@ -135,7 +107,7 @@ def agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_pre
                 finally:
                     sem.release()
                 print(f"[predator] died energy={energy}")
-                removeQUEUE(repro_ready_predator, os.getpid())
+                removeLIST(repro_ready_predator, os.getpid())
                 os.kill(os.getpid(), signal.SIGTERM)  # Terminates the process
                 break
 
@@ -145,21 +117,17 @@ def agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_pre
                 sem.acquire()
                 try:
                     tick, predators, preys, grass, drought = unpack(shm.buf)
-                    if preys > 0 and not prey_pid_queue.empty():
+                    if preys > 0 :
                         # Choisir une proie au hasard
-                        prey_pid = random_valueQUEUE(prey_pid_queue)  # prendre un PID au hasard
+                        prey_pid = random_valueLIST(prey_pid_list)  # prendre un PID au hasard
                         
-                        if prey_pid is None :
-                            print("[predator warning] no prey available to eat.")
-                            continue  # on passa au finally
-
-                        os.kill(prey_pid, signal.SIGTERM)  # tuer la proie (processus)            
-                        # Mettre à jour la mémoire partagée après avoir mangé la proie
-                        removeQUEUE(prey_pid_queue, prey_pid)  # enlever le PID de la queue des proies vivantes           
-                        removeQUEUE(repro_ready_prey, prey_pid)
-                        preys -= 1
-                        shm.buf[:SHM_SIZE] = pack(tick, predators, preys, grass, drought)
-                        ate = True
+                        if prey_pid is not None:
+                            os.kill(prey_pid, signal.SIGTERM)
+                            removeLIST(prey_pid_list, prey_pid)
+                            removeLIST(repro_ready_prey, prey_pid)
+                            preys = max(0, preys - 1)
+                            shm.buf[:SHM_SIZE] = pack(tick, predators, preys, grass, drought)
+                            ate = True
                 finally:
                     sem.release()
 
@@ -167,15 +135,15 @@ def agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_pre
                     energy += E_GAIN
                     # print("[predator] ate a prey")
 
-            # REPRO via socket
+            # REPRO
             if energy > R:
-                if value_inQUEUE(repro_ready_predator, os.getpid()) == False : 
-                    repro_ready_predator.put(os.getpid())
+                if value_inLIST(repro_ready_predator, os.getpid()) == False : 
+                    repro_ready_predator.append(os.getpid())
                 
-                if longueurQUEUE(repro_ready_predator) >= 2:
-                    p1 = repro_ready_predator.get()
-                    p2 = repro_ready_predator.get()
-                    new_pid = spawn_predator(children, prey_pid_queue, repro_ready_predator, repro_ready_prey)
+                if longueurLIST(repro_ready_predator) >= 2:
+                    p1 = repro_ready_predator.pop(0)
+                    p2 = repro_ready_predator.pop(0)
+                    new_pid = spawn_predator(children, prey_pid_list, repro_ready_predator, repro_ready_prey)
                     print(f"[prey] birth PREDATOR pid={new_pid} parents=({p1},{p2})")
     
                 else:

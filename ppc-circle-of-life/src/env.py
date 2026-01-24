@@ -28,10 +28,11 @@ G = 10
 DROUGHT_DURATION = 20
 DEBUG = True
 
-# Queue pour gérer les pid des Preys (dynamique)
-prey_pid_queue = mp.Queue()
-repro_ready_prey = mp.Queue()
-repro_ready_predator = mp.Queue()
+# Manager().list() pour gérer les pid des Preys (dynamique)
+manager = None
+prey_pid_list = None
+repro_ready_prey = None
+repro_ready_predator = None
 # -----------------------
 # SHARED MEMORY
 # -----------------------
@@ -102,23 +103,23 @@ def parse_line(line):
         raise ValueError("kind must be PREY or PREDATOR")
     return cmd, kind, pid
 
-def run_prey_proc(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey):
+def run_prey_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
     from prey import agent_main
-    agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey)
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
 
-def run_predator_proc(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey):
+def run_predator_proc(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey):
     from predator import agent_main
-    agent_main(host, port, prey_pid_queue, repro_ready_predator, repro_ready_prey)
+    agent_main(host, port, prey_pid_list, repro_ready_predator, repro_ready_prey)
 
 def spawn_prey(children):
-    p = mp.Process(target=run_prey_proc, args=(HOST, PORT, prey_pid_queue, repro_ready_predator, repro_ready_prey), daemon=False)
+    p = mp.Process(target=run_prey_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
     p.start()
     children.append(p)
-    prey_pid_queue.put(p.pid)  # Ajouter le PID de la proie dans la Queue
+    prey_pid_list.append(p.pid)  # Ajouter le PID de la proie dans la manager.list
     return p.pid
 
 def spawn_predator(children):
-    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_queue, repro_ready_predator, repro_ready_prey), daemon=False)
+    p = mp.Process(target=run_predator_proc, args=(HOST, PORT, prey_pid_list, repro_ready_predator, repro_ready_prey), daemon=False)
     p.start()
     children.append(p)
     return p.pid
@@ -279,7 +280,7 @@ def thread_display(mq, children, stop_event):
 
 
 def main():
-    global shm, sem, drought_tick, prey_pid_queue, repro_ready_predator, repro_ready_prey
+    global shm, sem, drought_tick,manager, prey_pid_list, repro_ready_predator, repro_ready_prey
 
     print(f"[env] PID={os.getpid()} starting")
 
@@ -300,9 +301,11 @@ def main():
         pass
 
     shm = shared_memory.SharedMemory(name=SHM_NAME, create=True, size=SHM_SIZE)
-    prey_pid_queue = mp.Queue()
-    repro_ready_prey = mp.Queue()
-    repro_ready_predator = mp.Queue()
+    
+    manager = mp.Manager()
+    prey_pid_list = manager.list()
+    repro_ready_prey = manager.list()
+    repro_ready_predator = manager.list()
 
     with ShmGuard(sem):
         shm.buf[:SHM_SIZE] = shm_pack(0, 0, 0, 100, 0)
@@ -323,15 +326,23 @@ def main():
     recv_buf = {}
 
     # Start threads
-    threading.Thread(target=thread_simulation, args=(shm, sem, drought_tick), daemon=False).start()
-    threading.Thread(target=thread_socket, args=(server, clients, recv_buf), daemon=False).start()
-    threading.Thread(target=thread_display, args=(mq, children, stop_event), daemon=False).start()
+    t_sim = threading.Thread(target=thread_simulation, args=(shm, sem, drought_tick), daemon=False)
+    t_sock = threading.Thread(target=thread_socket, args=(server, clients, recv_buf), daemon=False)
+    t_disp = threading.Thread(target=thread_display, args=(mq, children, stop_event), daemon=False)
+
+    t_sim.start()
+    t_sock.start()
+    t_disp.start()
 
     # Keep the main process alive
     try:
-        while True:
+        while not stop_event.is_set():
             time.sleep(1)
-    
+        
+        t_sim.join(timeout=1)
+        t_sock.join(timeout=1)
+        t_disp.join(timeout=1)
+
     except KeyboardInterrupt:
         print("\n[env] KeyboardInterrupt")
 
