@@ -7,3 +7,5 @@ Dans un second terminal dans le dossier src lancer la display permettant d'agir 
 python3 display.py
 
 A partir de maintenant vous pouvez regarder où en est la simulation, ajouter a votre guise des prey/predator, déclencher des sécheresses...
+
+librairies externe utilisées : sysv_ipc
